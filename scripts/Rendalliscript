@@ -236,3 +236,93 @@ BEGIN
     END CATCH
 END;
 GO
+>>>>>>>>>>>>>>>>silver should allow incremental..................................
+ALTER TABLE silver.deliveries
+ADD CONSTRAINT UQ_silver_deliveries UNIQUE (doc_no, size_range);
+GO
+
+CREATE TABLE bronze.loaded_files (
+    file_id     INT IDENTITY(1,1) PRIMARY KEY,
+    file_path   NVARCHAR(500) NOT NULL UNIQUE,
+    loaded_date DATETIME2 DEFAULT GETDATE()
+);
+GO
+
+CREATE OR ALTER PROCEDURE silver.load_silver
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        PRINT '>> Inserting new records into silver.deliveries (existing doc_no/size_range skipped)';
+
+        INSERT INTO silver.deliveries (
+            delivery_date, customer_name, size_range,
+            min_weight_g, max_weight_g, quantity, doc_no, doc_type
+        )
+        SELECT
+            b.delivery_date,
+            UPPER(TRIM(b.customer_name)) AS customer_name,
+            TRIM(b.size_range) AS size_range,
+
+            CASE 
+                WHEN LEFT(b.size_range, CHARINDEX('-', b.size_range) - 1) LIKE '%kg%'
+                    THEN CAST(REPLACE(LEFT(b.size_range, CHARINDEX('-', b.size_range) - 1), 'kg', '') AS DECIMAL(10,2)) * 1000
+                ELSE CAST(REPLACE(LEFT(b.size_range, CHARINDEX('-', b.size_range) - 1), 'g', '') AS DECIMAL(10,2))
+            END AS min_weight_g,
+
+            CASE 
+                WHEN RIGHT(b.size_range, LEN(b.size_range) - CHARINDEX('-', b.size_range)) LIKE '%kg%'
+                    THEN CAST(REPLACE(RIGHT(b.size_range, LEN(b.size_range) - CHARINDEX('-', b.size_range)), 'kg', '') AS DECIMAL(10,2)) * 1000
+                ELSE CAST(REPLACE(RIGHT(b.size_range, LEN(b.size_range) - CHARINDEX('-', b.size_range)), 'g', '') AS DECIMAL(10,2))
+            END AS max_weight_g,
+
+            b.tones AS quantity,
+            TRIM(b.doc_no) AS doc_no,
+            LEFT(b.doc_no, CHARINDEX('-', b.doc_no) - 1) AS doc_type
+        FROM bronze.deliveries_raw b
+        WHERE b.customer_name IS NOT NULL
+          AND b.tones > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM silver.deliveries s
+              WHERE s.doc_no = TRIM(b.doc_no)
+                AND s.size_range = TRIM(b.size_range)
+          );
+
+        PRINT '>> Silver append complete. New rows added: ' + CAST(@@ROWCOUNT AS NVARCHAR);
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in silver.load_silver: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.run_full_etl
+    @file_path NVARCHAR(500)
+AS
+BEGIN
+    BEGIN TRY
+        IF EXISTS (SELECT 1 FROM bronze.loaded_files WHERE file_path = @file_path)
+        BEGIN
+            PRINT 'File already loaded, skipping: ' + @file_path;
+            INSERT INTO bronze.etl_log (step, status, message) 
+            VALUES ('etl_run', 'SKIPPED', @file_path + ' already loaded');
+            RETURN;
+        END;
+
+        EXEC bronze.load_bronze @file_path = @file_path;
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('bronze', 'SUCCESS', @file_path);
+
+        EXEC silver.load_silver;
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('silver', 'SUCCESS', 'Append complete');
+
+        INSERT INTO bronze.loaded_files (file_path) VALUES (@file_path);
+
+        PRINT 'Full ETL run complete.';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('etl_run', 'FAILED', ERROR_MESSAGE());
+        THROW;
+    END CATCH
+END;
+GO
