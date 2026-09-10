@@ -1,0 +1,238 @@
+/* =========================================================
+   RENDALLIDATA — FULL DDL SCRIPT (Bronze / Silver / Gold)
+   ========================================================= */
+
+USE master;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = 'Rendallidata')
+BEGIN
+    ALTER DATABASE Rendallidata SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE Rendallidata;
+END;
+GO
+
+CREATE DATABASE Rendallidata;
+GO
+
+USE Rendallidata;
+GO
+
+CREATE SCHEMA bronze;
+GO
+CREATE SCHEMA silver;
+GO
+CREATE SCHEMA gold;
+GO
+
+/* =========================================================
+   SERVER-LEVEL SETUP FOR EXCEL LOADS (run once per server)
+   ========================================================= */
+
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+EXEC sp_configure 'Ad Hoc Distributed Queries', 1;
+RECONFIGURE;
+GO
+
+EXEC sp_MSset_oledb_prop N'Microsoft.ACE.OLEDB.16.0', N'AllowInProcess', 1;
+GO
+
+/* =========================================================
+   BRONZE LAYER — raw landing table
+   ========================================================= */
+
+CREATE TABLE bronze.deliveries_raw (
+    delivery_date   DATE,
+    customer_name   NVARCHAR(100),
+    size_range      NVARCHAR(50),
+    tones           DECIMAL(18,2),
+    doc_no          NVARCHAR(20)
+);
+GO
+
+/* =========================================================
+   SILVER LAYER — cleaned & standardized table
+   ========================================================= */
+
+CREATE TABLE silver.deliveries (
+    delivery_id     INT IDENTITY(1,1) PRIMARY KEY,
+    delivery_date   DATE            NOT NULL,
+    customer_name   NVARCHAR(100)   NOT NULL,
+    size_range      NVARCHAR(50)    NOT NULL,
+    min_weight_g    INT             NULL,
+    max_weight_g    INT             NULL,
+    quantity        DECIMAL(18,2)   NOT NULL,
+    doc_no          NVARCHAR(20)    NOT NULL,
+    doc_type        NVARCHAR(20)    NOT NULL,
+    dwh_create_date DATETIME2       DEFAULT GETDATE()
+);
+GO
+
+/* =========================================================
+   ETL LOG TABLE — tracks every run (bronze/silver/full)
+   ========================================================= */
+
+CREATE TABLE bronze.etl_log (
+    log_id      INT IDENTITY(1,1) PRIMARY KEY,
+    run_date    DATETIME2 DEFAULT GETDATE(),
+    step        NVARCHAR(50),
+    status      NVARCHAR(20),
+    message     NVARCHAR(500)
+);
+GO
+
+/* =========================================================
+   PROCEDURE: bronze.load_bronze
+   Loads a .xlsx delivery file directly into bronze
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE bronze.load_bronze
+    @file_path NVARCHAR(500)   -- e.g. 'C:\Rendalli\ETL\8_SEPT.xlsx'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        PRINT '>> Truncating bronze.deliveries_raw';
+        TRUNCATE TABLE bronze.deliveries_raw;
+
+        PRINT '>> Loading file: ' + @file_path;
+
+        DECLARE @sql NVARCHAR(MAX) = '
+            INSERT INTO bronze.deliveries_raw (delivery_date, customer_name, size_range, tones, doc_no)
+            SELECT 
+                CAST([Date] AS DATE),
+                CAST([CUSTOMER] AS NVARCHAR(100)),
+                CAST([Size] AS NVARCHAR(50)),
+                CAST([tones] AS DECIMAL(18,2)),
+                CAST([DOCNO] AS NVARCHAR(20))
+            FROM OPENROWSET(
+                ''Microsoft.ACE.OLEDB.16.0'',
+                ''Excel 12.0;Database=' + @file_path + ';HDR=YES'',
+                ''SELECT * FROM [Sheet1$]''
+            );';
+
+        EXEC sp_executesql @sql;
+
+        PRINT '>> Bronze load complete.';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in bronze.load_bronze: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH
+END;
+GO
+
+/* =========================================================
+   PROCEDURE: silver.load_silver
+   Cleans bronze data and loads into silver
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE silver.load_silver
+AS
+BEGIN
+    SET NOCOUNT ON;
+    BEGIN TRY
+        PRINT '>> Truncating silver.deliveries';
+        TRUNCATE TABLE silver.deliveries;
+
+        PRINT '>> Inserting cleaned data into silver.deliveries';
+        INSERT INTO silver.deliveries (
+            delivery_date, customer_name, size_range,
+            min_weight_g, max_weight_g, quantity, doc_no, doc_type
+        )
+        SELECT
+            delivery_date,
+            UPPER(TRIM(customer_name)) AS customer_name,
+            TRIM(size_range) AS size_range,
+
+            CASE 
+                WHEN LEFT(size_range, CHARINDEX('-', size_range) - 1) LIKE '%kg%'
+                    THEN CAST(REPLACE(LEFT(size_range, CHARINDEX('-', size_range) - 1), 'kg', '') AS DECIMAL(10,2)) * 1000
+                ELSE CAST(REPLACE(LEFT(size_range, CHARINDEX('-', size_range) - 1), 'g', '') AS DECIMAL(10,2))
+            END AS min_weight_g,
+
+            CASE 
+                WHEN RIGHT(size_range, LEN(size_range) - CHARINDEX('-', size_range)) LIKE '%kg%'
+                    THEN CAST(REPLACE(RIGHT(size_range, LEN(size_range) - CHARINDEX('-', size_range)), 'kg', '') AS DECIMAL(10,2)) * 1000
+                ELSE CAST(REPLACE(RIGHT(size_range, LEN(size_range) - CHARINDEX('-', size_range)), 'g', '') AS DECIMAL(10,2))
+            END AS max_weight_g,
+
+            tones AS quantity,
+            TRIM(doc_no) AS doc_no,
+            LEFT(doc_no, CHARINDEX('-', doc_no) - 1) AS doc_type
+        FROM bronze.deliveries_raw
+        WHERE customer_name IS NOT NULL
+          AND tones > 0;
+
+        PRINT '>> Silver load complete.';
+    END TRY
+    BEGIN CATCH
+        PRINT 'ERROR in silver.load_silver: ' + ERROR_MESSAGE();
+        THROW;
+    END CATCH
+END;
+GO
+
+/* =========================================================
+   GOLD LAYER — dimensional model (views over silver)
+   ========================================================= */
+
+CREATE OR ALTER VIEW gold.dim_customers AS
+SELECT
+    ROW_NUMBER() OVER (ORDER BY customer_name) AS customer_key,
+    customer_name,
+    CASE 
+        WHEN customer_name LIKE 'RENDALLI%' THEN 'Internal Branch'
+        ELSE 'External Customer'
+    END AS customer_category
+FROM (SELECT DISTINCT customer_name FROM silver.deliveries) c;
+GO
+
+CREATE OR ALTER VIEW gold.dim_sizes AS
+SELECT
+    ROW_NUMBER() OVER (ORDER BY min_weight_g) AS size_key,
+    size_range,
+    min_weight_g,
+    max_weight_g
+FROM (SELECT DISTINCT size_range, min_weight_g, max_weight_g FROM silver.deliveries) s;
+GO
+
+CREATE OR ALTER VIEW gold.fact_deliveries AS
+SELECT
+    d.delivery_id,
+    d.delivery_date,
+    c.customer_key,
+    s.size_key,
+    d.doc_no,
+    d.doc_type,
+    d.quantity
+FROM silver.deliveries d
+LEFT JOIN gold.dim_customers c ON d.customer_name = c.customer_name
+LEFT JOIN gold.dim_sizes s ON d.size_range = s.size_range;
+GO
+
+/* =========================================================
+   PROCEDURE: dbo.run_full_etl
+   Orchestrates bronze -> silver, with logging
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE dbo.run_full_etl
+    @file_path NVARCHAR(500)
+AS
+BEGIN
+    BEGIN TRY
+        EXEC bronze.load_bronze @file_path = @file_path;
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('bronze', 'SUCCESS', @file_path);
+
+        EXEC silver.load_silver;
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('silver', 'SUCCESS', 'Transform complete');
+
+        PRINT 'Full ETL run complete.';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO bronze.etl_log (step, status, message) VALUES ('etl_run', 'FAILED', ERROR_MESSAGE());
+        THROW;
+    END CATCH
+END;
+GO
